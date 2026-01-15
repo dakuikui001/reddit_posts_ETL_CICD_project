@@ -54,46 +54,170 @@ Raw CSV Files → Bronze Layer → Silver Layer → Gold Layer
 
 ---
 
+## Airflow DAG
+
+### DAG: `reddit_etl_pipeline`
+
+| Property | Value |
+|----------|-------|
+| Schedule | `0 8 * * *` (Daily at 8:00 AM SGT) |
+| Timezone | Asia/Singapore |
+| Catchup | Disabled |
+| Tags | reddit, spark, lakehouse |
+
+### Task Flow
+
+```
+run_scrapy_notebook → run_spark_etl_notebook → refresh_power_bi
+     (Scraping)           (ETL Pipeline)          (BI Refresh)
+```
+
+| Task | Description | Timeout |
+|------|-------------|---------|
+| `run_scrapy_notebook` | Scrape Reddit posts via Papermill | 10 min |
+| `run_spark_etl_notebook` | Run Bronze → Silver → Gold ETL | 20 min |
+
+---
+
 ## Table Structure
 
 ### Database: `reddit_db`
 
-#### Bronze Layer: `reddit_posts_bz`
+---
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `post_id` | STRING | Unique Reddit post identifier |
-| `title`, `author`, `selftext` | STRING | Post content fields |
-| `score`, `comments` | INT | Engagement metrics |
-| `upvote_ratio` | DOUBLE | Upvote ratio (0.0-1.0) |
-| `flair`, `domain`, `url` | STRING | Metadata fields |
-| `is_video`, `is_self` | STRING | Raw boolean strings |
-| `created_utc` | STRING | Post creation timestamp |
-| `extracted_time`, `load_time` | TIMESTAMP | Pipeline timestamps |
+### Bronze Layer Tables
 
-#### Silver Layer: `reddit_posts_sl`
+#### `reddit_posts_bz`
 
-Same as Bronze with transformations:
-- `is_video`, `is_self` → BOOLEAN
-- `created_utc` → TIMESTAMP
-- CDC enabled (`delta.enableChangeDataFeed = true`)
-- Added `update_time` column
+**Purpose**: Raw data landing zone with validation. Stores Reddit posts as ingested from CSV files.
 
-#### Gold Layer: Star Schema
+**Storage Format**: Delta Lake  
+**Location**: `s3a://{bucket}/reddit_db/reddit_posts_bz`
 
-**`fact_posts_gl`**: Core metrics with derived `format` column (text/video/Others)
+| Column Name | Data Type | Nullable | Description |
+|------------|-----------|----------|-------------|
+| `post_id` | STRING | No | Unique identifier for Reddit post |
+| `title` | STRING | Yes | Post title |
+| `author` | STRING | Yes | Reddit username of post author |
+| `score` | INT | Yes | Net upvotes/downvotes score |
+| `upvote_ratio` | DOUBLE | Yes | Ratio of upvotes to total votes (0.0-1.0) |
+| `comments` | INT | Yes | Number of comments on the post |
+| `flair` | STRING | Yes | Post flair/tag category |
+| `is_video` | STRING | Yes | Whether post contains video (raw string: "True"/"False") |
+| `is_self` | STRING | Yes | Whether post is a self-post (raw string: "True"/"False") |
+| `domain` | STRING | Yes | Domain of linked content (e.g., "self.singapore", "youtube.com") |
+| `url` | STRING | Yes | Full URL of the post or linked content |
+| `created_utc` | STRING | Yes | Post creation timestamp in UTC (format: "yyyy-MM-dd HH:mm:ss") |
+| `selftext` | STRING | Yes | Post body text content (for self-posts) |
+| `extracted_time` | TIMESTAMP | Yes | Timestamp when data was scraped/extracted |
+| `load_time` | TIMESTAMP | Yes | Timestamp when data was loaded into Bronze layer |
 
-**Dimensions**: `dim_authors_gl`, `dim_flairs_gl`, `dim_domains_gl`
+---
+
+### Silver Layer Tables
+
+#### `reddit_posts_sl`
+
+**Purpose**: Cleaned and transformed data layer with CDC tracking.
+
+**Storage Format**: Delta Lake (with CDC enabled)  
+**Location**: `s3a://{bucket}/reddit_db/reddit_posts_sl`  
+**Change Data Capture**: Enabled (`delta.enableChangeDataFeed = true`)
+
+| Column Name | Data Type | Nullable | Description |
+|------------|-----------|----------|-------------|
+| `post_id` | STRING | No | Unique identifier for Reddit post |
+| `title` | STRING | Yes | Post title |
+| `author` | STRING | Yes | Reddit username of post author |
+| `score` | INT | Yes | Net upvotes/downvotes score |
+| `upvote_ratio` | DOUBLE | Yes | Ratio of upvotes to total votes (0.0-1.0) |
+| `comments` | INT | Yes | Number of comments on the post |
+| `flair` | STRING | Yes | Post flair/tag category |
+| `is_video` | BOOLEAN | Yes | Whether post contains video (converted from STRING) |
+| `is_self` | BOOLEAN | Yes | Whether post is a self-post (converted from STRING) |
+| `domain` | STRING | Yes | Domain of linked content |
+| `url` | STRING | Yes | Full URL of the post or linked content |
+| `created_utc` | TIMESTAMP | Yes | Post creation timestamp (converted from STRING) |
+| `selftext` | STRING | Yes | Post body text content |
+| `extracted_time` | TIMESTAMP | Yes | Timestamp when data was scraped/extracted |
+| `load_time` | TIMESTAMP | Yes | Timestamp when data was loaded into Bronze layer |
+| `update_time` | TIMESTAMP | Yes | Timestamp when row was last updated in Silver layer |
+
+**MERGE Logic**:
+```sql
+MERGE INTO reddit_posts_sl a USING reddit_posts_sl_delta b ON a.post_id = b.post_id
+WHEN MATCHED AND (a.score != b.score OR a.comments != b.comments OR a.upvote_ratio != b.upvote_ratio) 
+THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
+```
+
+---
+
+### Gold Layer Tables (Star Schema)
+
+#### `fact_posts_gl` (Fact Table)
+
+**Purpose**: Central fact table for analytics and reporting.
+
+**Storage Format**: Delta Lake  
+**Location**: `s3a://{bucket}/reddit_db/fact_posts_gl`
+
+| Column Name | Data Type | Nullable | Description |
+|------------|-----------|----------|-------------|
+| `post_id` | STRING | No | Unique identifier for Reddit post (primary key) |
+| `title` | STRING | Yes | Post title |
+| `author` | STRING | Yes | Reddit username (FK to `dim_authors_gl`) |
+| `score` | INT | Yes | Net upvotes/downvotes score |
+| `upvote_ratio` | DOUBLE | Yes | Ratio of upvotes to total votes (0.0-1.0) |
+| `comments` | INT | Yes | Number of comments on the post |
+| `flair` | STRING | Yes | Post flair category (FK to `dim_flairs_gl`) |
+| `domain` | STRING | Yes | Domain of linked content (FK to `dim_domains_gl`) |
+| `format` | STRING | Yes | Post format: "text" (self-post), "video", or "Others" |
+| `url` | STRING | Yes | Full URL of the post or linked content |
+| `created_utc` | TIMESTAMP | Yes | Post creation timestamp |
+| `selftext` | STRING | Yes | Post body text content |
+| `extracted_time` | TIMESTAMP | Yes | Timestamp when data was scraped/extracted |
+| `update_time` | TIMESTAMP | Yes | Timestamp when row was last updated |
+
+#### `dim_authors_gl` (Dimension Table)
+
+| Column Name | Data Type | Description |
+|------------|-----------|-------------|
+| `author` | STRING | Reddit username (primary key) |
+| `update_time` | TIMESTAMP | Last update timestamp |
+
+#### `dim_flairs_gl` (Dimension Table)
+
+| Column Name | Data Type | Description |
+|------------|-----------|-------------|
+| `flair` | STRING | Post flair category (primary key) |
+| `update_time` | TIMESTAMP | Last update timestamp |
+
+#### `dim_domains_gl` (Dimension Table)
+
+| Column Name | Data Type | Description |
+|------------|-----------|-------------|
+| `domain` | STRING | Content domain (primary key) |
+| `update_time` | TIMESTAMP | Last update timestamp |
+
+---
+
+### Data Quality Tables
 
 #### `data_quality_quarantine`
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `table_name` | STRING | Source table |
-| `gx_batch_id` | STRING | Batch identifier |
-| `violated_rules` | STRING | Failed expectations |
-| `raw_data` | STRING | JSON of failed row |
-| `ingestion_time` | TIMESTAMP | Quarantine time |
+**Purpose**: Quarantine table for rows failing Great Expectations validation.
+
+**Storage Format**: Delta Lake  
+**Location**: `s3a://{bucket}/reddit_db/data_quality_quarantine`
+
+| Column Name | Data Type | Nullable | Description |
+|------------|-----------|----------|-------------|
+| `table_name` | STRING | No | Source table where validation failed |
+| `gx_batch_id` | STRING | No | Great Expectations batch identifier |
+| `violated_rules` | STRING | Yes | Concatenated list of failed expectations |
+| `raw_data` | STRING | Yes | JSON representation of the failed row |
+| `ingestion_time` | TIMESTAMP | Yes | Timestamp when row was quarantined |
 
 ---
 
