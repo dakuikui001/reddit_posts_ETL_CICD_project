@@ -4,7 +4,7 @@ services:
   astro-app:
     image: ${DOCKERHUB_USERNAME}/airflow-02-reddit-project:latest
     container_name: airflow-02-reddit-project
-    # 之前调试成功的权限修复逻辑
+    # 权限修复与启动逻辑
     command: >
       bash -c "
       airflow db migrate &&
@@ -20,10 +20,10 @@ services:
       - AIRFLOW__CORE__SQL_ALCHEMY_CONN=sqlite:////usr/local/airflow/airflow.db
     ports:
       - "8085:8080"
-    # 这里直接指定 override 里的网络 
     networks:
       - data_lake_net
 
+# 注意：顶级 networks 必须与 services 顶格对齐
 networks:
   data_lake_net:
-    [cite_start]external: true # 明确引用外部网络
+    external: true
